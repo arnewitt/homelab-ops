@@ -1,0 +1,120 @@
+---
+- name: Homelab Setup - Docker, Open WebUI, Watchtower & btop
+  hosts: all
+  become: true
+  vars:
+    webui_port: "3000"
+    data_dir: "/opt/open-webui/data"
+    env_file: ".env"
+    docker_keyring_path: "/usr/share/keyrings/docker.gpg"
+    docker_repo_arch: "amd64"
+
+  tasks:
+    # --- PHASE 0: VALIDATION ---
+    - name: Ensure env file exists
+      stat:
+        path: "{{ env_file }}"
+      register: env_file_stat
+
+    - name: Abort if env file is missing
+      fail:
+        msg: "Required env file not found: {{ env_file }}"
+      when: not env_file_stat.stat.exists
+
+    # --- PHASE 1: SYSTEM UTILITIES & DOCKER ---
+    - name: Install system utilities and Docker dependencies
+      apt:
+        update_cache: yes
+        name:
+          - btop
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - python3-pip
+        state: present
+
+    - name: Add Docker GPG key (keyring)
+      get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: "{{ docker_keyring_path }}"
+        mode: "0644"
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch={{ docker_repo_arch }} signed-by={{ docker_keyring_path }}] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        filename: docker
+
+    - name: Install Docker Engine
+      apt:
+        update_cache: yes
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Ensure Docker service is enabled and running
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Ensure Docker SDK for Python is present
+      pip:
+        name: docker
+        state: present
+
+    # --- PHASE 2: STORAGE & NETWORK ---
+    - name: Create local directory for persistence
+      file:
+        path: "{{ data_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure dedicated Docker network exists
+      docker_network:
+        name: homelab-net
+        state: present
+
+    # --- PHASE 3: DEPLOY OPEN WEBUI ---
+    - name: Deploy Open WebUI
+      docker_container:
+        name: open-webui
+        image: ghcr.io/open-webui/open-webui:latest
+        state: started
+        restart_policy: always
+        pull: true
+        networks:
+          - name: homelab-net
+        ports:
+          - "{{ webui_port }}:8080"
+        volumes:
+          - "{{ data_dir }}:/app/backend/data"
+        env:
+          ENABLE_OLLAMA_API: "False"
+          OPENAI_API_KEY: "{{ lookup('ini', 'OPENAI_API_KEY type=properties file=' + env_file) }}"
+          OPENAI_API_BASE_URL: "{{ lookup('ini', 'OPENAI_API_BASE_URL type=properties file=' + env_file) }}"
+          WEBUI_SECRET_KEY: "{{ lookup('ini', 'WEBUI_SECRET_KEY type=properties file=' + env_file) }}"
+        healthcheck:
+          test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+          interval: 60s
+          timeout: 10s
+          retries: 3
+
+    # --- PHASE 4: AUTOMATIC UPDATES ---
+    - name: Deploy Watchtower
+      docker_container:
+        name: watchtower
+        image: containrrr/watchtower:latest
+        state: started
+        restart_policy: always
+        pull: true
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+        env:
+          WATCHTOWER_POLL_INTERVAL: "86400"
+          WATCHTOWER_CLEANUP: "true"
